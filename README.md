@@ -22,10 +22,12 @@ nobody in particular can decline.
   (verifies every block in a service worker), or any gateway / your own node.
   Newer CIDs are in the [release notes](https://github.com/kotoba-lang/tsudoi/releases).
 - Mirror of the same `web/` bytes: <https://kotoba-lang.github.io/tsudoi/>
-- Durable copy on Filecoin: each release's site is archived as a CAR on
-  [Fil One](https://fil.one) (`s3://tsudoi/car/<cid>.car`, us-east-1, via
-  `scripts/archive-filone.sh`). Fil One does not serve IPFS; `ipfs dag import`
-  of that CAR on any node restores the identical CID.
+- Pinned on Filecoin: the site's CID is stored with a Filecoin Onchain Cloud
+  provider ([filecoin-pin](https://github.com/filecoin-project/filecoin-pin),
+  `scripts/pin-filecoin.sh`), which announces it to IPNI and serves it over
+  the IPFS trustless gateway protocol — retrievable without any machine of
+  ours online. A second archival copy of the CAR is on
+  [Fil One](https://fil.one) (`scripts/archive-filone.sh`).
 
 ## How it is built
 

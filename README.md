@@ -17,9 +17,11 @@ nobody in particular can decline.
 
 ## Open it
 
-- IPFS: see the CID in the [latest release notes](../../releases) or
-  `ipfs://<cid>` — any gateway works, e.g. `https://<cid>.ipfs.dweb.link/`
-- Mirror: <https://kotoba-lang.github.io/tsudoi/>
+- IPFS (v0.1.0): `ipfs://bafybeifkijv4c4tj6lbcvby43tc7nt2eea6nln7d5w4rxsu2dykvjv5gfy`
+  — in a browser: <https://bafybeifkijv4c4tj6lbcvby43tc7nt2eea6nln7d5w4rxsu2dykvjv5gfy.ipfs.inbrowser.link/>
+  (verifies every block in a service worker), or any gateway / your own node.
+  Newer CIDs are in the [release notes](https://github.com/kotoba-lang/tsudoi/releases).
+- Mirror of the same `web/` bytes: <https://kotoba-lang.github.io/tsudoi/>
 
 ## How it is built
 

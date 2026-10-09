@@ -1,0 +1,1074 @@
+(ns tsudoi
+  ;; tsudoi (集い) -- a Reddit-style forum whose application is written in
+  ;; Kotoba and whose data lives on Nostr relays. There is no server.
+  ;;
+  ;; This module is the whole application: what a post, a comment and a vote
+  ;; ARE, which events are admitted, how a thread is ordered, how the feed is
+  ;; ranked, what is published when someone presses "submit", what the page
+  ;; looks like, and which data the page needs next. It is pure -- it compiles
+  ;; with an EMPTY `requiredCapabilities` and is granted nothing. It never sees
+  ;; a socket, a key, a clock or the DOM.
+  ;;
+  ;; The host (`web/host.mjs`) is mechanism only:
+  ;;
+  ;;   * it verifies Nostr signatures and drops anything that fails,
+  ;;   * it caches verified events and acts as a local relay for this module:
+  ;;     whatever `wants` asks for is replayed from cache, then streamed live,
+  ;;   * it keeps votes as last-writer-wins registers per (voter, target) and
+  ;;     reports a register change as {:type "vote" :old .. :new ..},
+  ;;   * it signs and broadcasts whatever this module puts in `:outbox`,
+  ;;   * it renders `view` through the deny-by-default reconciler.
+  ;;
+  ;; Exports -- the contract the host drives:
+  ;;
+  ;;   init   ()                                -> state
+  ;;   view   (state)                           -> UI :document
+  ;;   step   (state, target, kind, value)      -> state     ; a UI event
+  ;;   ingest (state, input :document)          -> state     ; a host input
+  ;;   wants  (state)                           -> :document ; what to fetch
+  ;;
+  ;; Bounds that shape the design (amu js-browser-kotoba-v1, measured):
+  ;;
+  ;;   * a :document vector or map holds at most 32 items. The feed is a
+  ;;     window of `feed-cap` posts; a thread shows `comment-cap` comments.
+  ;;     A post that does not rank into the window is not kept -- the cache in
+  ;;     the host still holds it, and it comes back when it ranks.
+  ;;   * a :document nests at most 8 levels (maps, vectors AND leaves count).
+  ;;     A UI node is a map whose :children is a vector, so a view is at most
+  ;;     four element levels deep. Comment nesting is therefore not DOM
+  ;;     nesting: a thread is a flat list in tree order with a depth class.
+  ;;   * `document-vector-sort` orders by canonical bytes, not by number, so
+  ;;     ranking uses its own selection sort over at most 32 items.
+  ;;   * `string-substring` takes byte offsets and traps inside a code point,
+  ;;     so truncation walks code points (`cut`).
+  (:export [init view step ingest wants]))
+
+;; --- limits ---------------------------------------------------------------
+
+(defn feed-cap [] :i64 25)
+(defn comment-cap [] :i64 30)
+(defn sub-cap [] :i64 12)
+(defn relay-cap [] :i64 8)
+(defn excerpt-bytes [] :i64 360)
+(defn body-bytes [] :i64 12000)
+(defn comment-bytes [] :i64 1500)
+(defn title-bytes [] :i64 300)
+
+;; --- document accessors ---------------------------------------------------
+
+(defn dget [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn dstr [d :document] :string
+  (option-value-of [:option :string] (document-string-value d) ""))
+
+(defn dint [d :document] :i64
+  (option-value-of [:option :i64] (document-i64-value d) 0))
+
+(defn dat [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn gstr [d :document k :keyword] :string (dstr (dget d k)))
+(defn gint [d :document k :keyword] :i64 (dint (dget d k)))
+
+(defn sput [d :document k :keyword s :string] :document
+  (document-assoc d k (document-string s)))
+
+(defn iput [d :document k :keyword n :i64] :document
+  (document-assoc d k (document-i64 n)))
+
+(defn vec-or-empty [v :document] :document
+  (if (= (document-count v) 0) (document-vector) v))
+
+;; --- strings --------------------------------------------------------------
+
+(defn cp-width [cp :i64] :i64
+  (cond
+    (< cp 128) 1
+    (< cp 2048) 2
+    (< cp 65536) 3
+    :else 4))
+
+;; Longest prefix of `s` that is at most `limit` bytes and ends on a code
+;; point boundary.
+(defn cut [s :string limit :i64] :string
+  (let [n (string-byte-length s)]
+    (if (<= n limit)
+      s
+      (loop [i 0]
+        (let [w (cp-width (string-code-point-at s i))]
+          (if (> (+ i w) limit)
+            (string-concat (string-substring s 0 i) "…")
+            (recur (+ i w))))))))
+
+;; Not a substring compare: a byte slice of `s` can end inside a code point.
+(defn starts-with? [s :string prefix :string] :bool
+  (or (string=? prefix "")
+      (= (string-index-of s prefix) 0)))
+
+(defn after-prefix [s :string prefix :string] :string
+  (string-substring s (string-byte-length prefix) (string-byte-length s)))
+
+(defn trim-leading-newlines [s :string] :string
+  (loop [t s]
+    (cond
+      (starts-with? t "\n") (recur (after-prefix t "\n"))
+      (starts-with? t "\r") (recur (after-prefix t "\r"))
+      :else t)))
+
+;; Sub names are [a-z0-9_]{2,24}. Upper case is folded first.
+(defn name-char? [cp :i64] :bool
+  (or (and (>= cp 97) (<= cp 122))
+      (and (>= cp 48) (<= cp 57))
+      (= cp 95)))
+
+(defn sub-name-ok? [s :string] :bool
+  (let [n (string-byte-length s)]
+    (and (>= n 2) (<= n 24)
+         (loop [i 0]
+           (cond
+             (>= i n) true
+             (name-char? (string-code-point-at s i)) (recur (+ i 1))
+             :else false)))))
+
+(defn short-id [hex :string] :string
+  (if (< (string-byte-length hex) 8) hex (string-substring hex 0 8)))
+
+(defn hex64? [s :string] :bool
+  (and (= (string-byte-length s) 64)
+       (loop [i 0]
+         (cond
+           (>= i 64) true
+           (let [c (string-code-point-at s i)]
+             (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102))))
+           (recur (+ i 1))
+           :else false))))
+
+(defn ago [now :i64 t :i64] :string
+  (let [d (- now t)]
+    (cond
+      (<= now 0) ""
+      (< d 60) "just now"
+      (< d 3600) (string-concat (string-from-i64 (quot d 60)) "m ago")
+      (< d 86400) (string-concat (string-from-i64 (quot d 3600)) "h ago")
+      (< d 2592000) (string-concat (string-from-i64 (quot d 86400)) "d ago")
+      :else (string-concat (string-from-i64 (quot d 2592000)) "mo ago"))))
+
+;; --- nostr tags -----------------------------------------------------------
+;;
+;; A tag is a vector of strings. These read the first tag whose name matches.
+
+(defn tag-at [tags :document i :i64 j :i64] :string
+  (dstr (dat (dat tags i) j)))
+
+(defn tag-value [tags :document name :string] :string
+  (let [n (document-count tags)]
+    (loop [i 0]
+      (cond
+        (>= i n) ""
+        (string=? (tag-at tags i 0) name) (tag-at tags i 1)
+        :else (recur (+ i 1))))))
+
+(defn has-tag? [tags :document name :string value :string] :bool
+  (let [n (document-count tags)]
+    (loop [i 0]
+      (cond
+        (>= i n) false
+        (and (string=? (tag-at tags i 0) name)
+             (string=? (tag-at tags i 1) value)) true
+        :else (recur (+ i 1))))))
+
+(defn count-tag [tags :document name :string] :i64
+  (let [n (document-count tags)]
+    (loop [i 0 c 0]
+      (cond
+        (>= i n) c
+        (string=? (tag-at tags i 0) name) (recur (+ i 1) (+ c 1))
+        :else (recur (+ i 1) c)))))
+
+;; NIP-10: the "e" tag marked `marker`, else "".
+(defn marked-e [tags :document marker :string] :string
+  (let [n (document-count tags)]
+    (loop [i 0]
+      (cond
+        (>= i n) ""
+        (and (string=? (tag-at tags i 0) "e")
+             (string=? (tag-at tags i 3) marker)) (tag-at tags i 1)
+        :else (recur (+ i 1))))))
+
+;; NIP-10 deprecated positional form: first "e" is the root, last the parent.
+(defn nth-e [tags :document want-last :bool] :string
+  (let [n (document-count tags)]
+    (loop [i 0 found ""]
+      (cond
+        (>= i n) found
+        (string=? (tag-at tags i 0) "e")
+        (if want-last
+          (recur (+ i 1) (tag-at tags i 1))
+          (tag-at tags i 1))
+        :else (recur (+ i 1) found)))))
+
+(defn root-of [tags :document] :string
+  (let [r (marked-e tags "root")]
+    (if (string=? r "") (nth-e tags false) r)))
+
+(defn parent-of [tags :document] :string
+  (let [p (marked-e tags "reply")]
+    (cond
+      (not (string=? p "")) p
+      (not (string=? (marked-e tags "root") "")) (marked-e tags "root")
+      :else (nth-e tags true))))
+
+;; The sub of a post: its "tsudoi-<name>" hashtag.
+(defn sub-of [tags :document] :string
+  (let [n (document-count tags)]
+    (loop [i 0]
+      (cond
+        (>= i n) ""
+        (and (string=? (tag-at tags i 0) "t")
+             (starts-with? (tag-at tags i 1) "tsudoi-"))
+        (let [s (after-prefix (tag-at tags i 1) "tsudoi-")]
+          (if (sub-name-ok? s) s ""))
+        :else (recur (+ i 1))))))
+
+;; --- ranking --------------------------------------------------------------
+
+(defn digits [n :i64] :i64
+  (loop [x n d 0]
+    (if (<= x 0) d (recur (quot x 10) (+ d 1)))))
+
+;; Reddit's hot rank in integers: order of magnitude of the score is worth
+;; 45000 seconds of age (12.5 hours), signed by the score's direction.
+(defn hot [score :i64 created :i64] :i64
+  (cond
+    (> score 0) (+ created (* 45000 (digits score)))
+    (< score 0) (- created (* 45000 (digits (- 0 score))))
+    :else created))
+
+(defn rank-key [p :document mode :string] :i64
+  (cond
+    (string=? mode "new") (gint p :created)
+    (string=? mode "top") (+ (* (gint p :score) 4294967296) (gint p :created))
+    :else (hot (gint p :score) (gint p :created))))
+
+;; Whether the vector of i64 documents `v` holds `x`.
+(defn has-i64? [v :document x :i64] :bool
+  (let [n (document-count v)]
+    (loop [i 0]
+      (cond
+        (>= i n) false
+        (= (dint (dat v i)) x) true
+        :else (recur (+ i 1))))))
+
+(defn has-str? [v :document x :string] :bool
+  (let [n (document-count v)]
+    (loop [i 0]
+      (cond
+        (>= i n) false
+        (string=? (dstr (dat v i)) x) true
+        :else (recur (+ i 1))))))
+
+;; Index of the item with the highest key that is not yet in `taken`.
+(defn best-index [items :document mode :string taken :document] :i64
+  (let [n (document-count items)]
+    (loop [i 0 best -1 best-key 0]
+      (cond
+        (>= i n) best
+        (has-i64? taken i) (recur (+ i 1) best best-key)
+        (or (< best 0) (> (rank-key (dat items i) mode) best-key))
+        (recur (+ i 1) i (rank-key (dat items i) mode))
+        :else (recur (+ i 1) best best-key)))))
+
+;; Indices of `items`, highest key first.
+(defn ranked [items :document mode :string] :document
+  (let [n (document-count items)]
+    (loop [order (document-vector)]
+      (if (>= (document-count order) n)
+        order
+        (recur (document-vector-conj order (document-i64 (best-index items mode order))))))))
+
+(defn worst-index [items :document] :i64
+  (let [n (document-count items)]
+    (loop [i 0 worst -1 worst-key 0]
+      (cond
+        (>= i n) worst
+        (or (< worst 0) (< (rank-key (dat items i) "hot") worst-key))
+        (recur (+ i 1) i (rank-key (dat items i) "hot"))
+        :else (recur (+ i 1) worst worst-key)))))
+
+(defn index-of-id [items :document id :string] :i64
+  (let [n (document-count items)]
+    (loop [i 0]
+      (cond
+        (>= i n) -1
+        (string=? (gstr (dat items i) :id) id) i
+        :else (recur (+ i 1))))))
+
+;; --- state ----------------------------------------------------------------
+
+(defn default-relays [] :document
+  (document-vector (document-string "wss://relay.damus.io")
+                   (document-string "wss://nos.lol")
+                   (document-string "wss://relay.primal.net")
+                   (document-string "wss://relay.nostr.band")))
+
+(defn init [] :document
+  (document-map
+   :route (document-string "front")
+   :sub (document-string "")
+   :post-id (document-string "")
+   :sort (document-string "hot")
+   :epoch (document-i64 1)
+   :now (document-i64 0)
+   :me (document-string "")
+   :posts (document-vector)
+   :root (document-map)
+   :comments (document-vector)
+   :hidden (document-i64 0)
+   :subs (document-vector (document-string "vibecoding"))
+   :relays (default-relays)
+   :relay-draft (document-string "")
+   :draft-sub (document-string "vibecoding")
+   :draft-title (document-string "")
+   :draft-body (document-string "")
+   :reply-to (document-string "")
+   :reply-body (document-string "")
+   :notice (document-string "")
+   :outbox (document-vector)))
+
+(defn note [state :document text :string] :document
+  (sput state :notice text))
+
+;; A new route empties the windows and moves the epoch, which tells the host
+;; to forget what it already delivered and replay from its cache.
+(defn go [state :document route :string sub :string post-id :string] :document
+  (-> state
+      (sput :route route)
+      (sput :sub sub)
+      (sput :post-id post-id)
+      (document-assoc :posts (document-vector))
+      (document-assoc :root (document-map))
+      (document-assoc :comments (document-vector))
+      (iput :hidden 0)
+      (sput :reply-to "")
+      (sput :notice "")
+      (iput :epoch (+ 1 (gint state :epoch)))))
+
+(defn remember-sub [state :document sub :string] :document
+  (let [subs (dget state :subs)]
+    (cond
+      (string=? sub "") state
+      (has-str? subs sub) state
+      (>= (document-count subs) (sub-cap)) state
+      :else (document-assoc state :subs (document-vector-conj subs (document-string sub))))))
+
+;; "#/", "#/r/<sub>", "#/p/<id>", "#/submit", "#/settings"
+(defn route-from-hash [state :document hash :string] :document
+  (let [h (if (starts-with? hash "#") (after-prefix hash "#") hash)]
+    (cond
+      (starts-with? h "/r/")
+      (let [s (string-fold-case (after-prefix h "/r/"))]
+        (if (sub-name-ok? s)
+          (-> (go state "sub" s "") (remember-sub s) (sput :draft-sub s))
+          (note (go state "front" "" "") "no such sub")))
+      (starts-with? h "/p/")
+      (let [id (after-prefix h "/p/")]
+        (if (hex64? id)
+          (go state "post" (gstr state :sub) id)
+          (note (go state "front" "" "") "no such post")))
+      (string=? h "/submit") (go state "submit" (gstr state :sub) "")
+      (string=? h "/settings") (go state "settings" "" "")
+      :else (go state "front" "" ""))))
+
+;; --- admitting events -----------------------------------------------------
+;;
+;; Every input below came from the network. The host has checked only that
+;; it is a well-formed, correctly signed Nostr event; everything about what
+;; it MEANS is decided here, and anything that does not fit is dropped.
+
+(defn post-from [e :document] :document
+  (let [tags (dget e :tags)
+        title (cut (tag-value tags "subject") (title-bytes))
+        raw (gstr e :content)
+        ;; Posts are published as "title\n\nbody" so that ordinary Nostr
+        ;; clients show something sensible; the title is stripped back off.
+        body (trim-leading-newlines
+              (if (starts-with? raw title) (after-prefix raw title) raw))]
+    (document-map
+     :id (document-string (gstr e :id))
+     :author (document-string (gstr e :pubkey))
+     :created (document-i64 (gint e :created_at))
+     :sub (document-string (sub-of tags))
+     :title (document-string title)
+     :body (document-string (cut body (body-bytes)))
+     :score (document-i64 0)
+     :ncom (document-i64 0)
+     :mine (document-i64 0))))
+
+(defn excerpt [p :document] :document
+  (sput p :body (cut (gstr p :body) (excerpt-bytes))))
+
+(defn is-post? [e :document] :bool
+  (let [tags (dget e :tags)]
+    (and (= (gint e :kind) 1)
+         (has-tag? tags "t" "tsudoi")
+         (not (string=? (tag-value tags "subject") ""))
+         (not (string=? (sub-of tags) ""))
+         (= (count-tag tags "e") 0))))
+
+(defn is-comment? [e :document] :bool
+  (let [tags (dget e :tags)]
+    (and (= (gint e :kind) 1)
+         (> (count-tag tags "e") 0)
+         (hex64? (root-of tags))
+         (not (string=? (gstr e :content) "")))))
+
+(defn in-scope? [state :document p :document] :bool
+  (or (string=? (gstr state :route) "front")
+      (string=? (gstr p :sub) (gstr state :sub))))
+
+;; Put a post into the feed window, evicting the lowest-ranked post when the
+;; window is full and the newcomer outranks it.
+(defn admit-post [state :document p :document] :document
+  (let [posts (dget state :posts)
+        n (document-count posts)]
+    (cond
+      (>= (index-of-id posts (gstr p :id)) 0) state
+      (< n (feed-cap))
+      (document-assoc state :posts (document-vector-conj posts (excerpt p)))
+      :else
+      (let [w (worst-index posts)]
+        (if (> (rank-key p "hot") (rank-key (dat posts w) "hot"))
+          (document-assoc state :posts (document-vector-assoc posts w (excerpt p)))
+          state)))))
+
+(defn comment-from [e :document] :document
+  (let [tags (dget e :tags)]
+    (document-map
+     :id (document-string (gstr e :id))
+     :author (document-string (gstr e :pubkey))
+     :created (document-i64 (gint e :created_at))
+     :parent (document-string (parent-of tags))
+     :body (document-string (cut (gstr e :content) (comment-bytes)))
+     :score (document-i64 0)
+     :mine (document-i64 0))))
+
+(defn bump-ncom [state :document root :string] :document
+  (let [posts (dget state :posts)
+        i (index-of-id posts root)]
+    (if (< i 0)
+      state
+      (let [p (dat posts i)]
+        (document-assoc state :posts
+                        (document-vector-assoc posts i (iput p :ncom (+ 1 (gint p :ncom)))))))))
+
+(defn admit-comment [state :document e :document] :document
+  (let [root (root-of (dget e :tags))]
+    (if (and (string=? (gstr state :route) "post")
+             (string=? root (gstr state :post-id)))
+      (let [cs (dget state :comments)]
+        (cond
+          (>= (index-of-id cs (gstr e :id)) 0) state
+          (>= (document-count cs) (comment-cap)) (iput state :hidden (+ 1 (gint state :hidden)))
+          :else (document-assoc state :comments
+                                (document-vector-conj cs (comment-from e)))))
+      (bump-ncom state root))))
+
+(defn admit-event [state :document e :document] :document
+  (cond
+    (is-post? e)
+    (let [p (post-from e)
+          s (remember-sub state (gstr p :sub))]
+      (cond
+        (and (string=? (gstr s :route) "post")
+             (string=? (gstr p :id) (gstr s :post-id)))
+        (document-assoc s :root p)
+        (or (string=? (gstr s :route) "front") (string=? (gstr s :route) "sub"))
+        (if (in-scope? s p) (admit-post s p) s)
+        :else s))
+    (is-comment? e) (admit-comment state e)
+    :else state))
+
+;; --- votes ----------------------------------------------------------------
+
+(defn vote-value [content :string] :i64
+  (cond
+    (string=? content "-") -1
+    (string=? content "+") 1
+    ;; NIP-25: an empty reaction is a like; any other emoji is not a vote.
+    (string=? content "") 0
+    :else 0))
+
+(defn apply-vote [item :document delta :i64 mine :bool value :i64] :document
+  (let [scored (iput item :score (+ (gint item :score) delta))]
+    (if mine (iput scored :mine value) scored)))
+
+(defn vote-in [state :document k :keyword target :string delta :i64 mine-value :i64] :document
+  (let [items (dget state k)
+        i (index-of-id items target)]
+    (if (< i 0)
+      state
+      (document-assoc state k
+                      (document-vector-assoc items i
+                                             (apply-vote (dat items i) delta
+                                                         (>= mine-value -1) mine-value))))))
+
+(defn admit-vote [state :document input :document] :document
+  (let [target (gstr input :target)
+        before (if (= (gint input :had) 0) 0 (vote-value (gstr input :old)))
+        after (vote-value (gstr input :new))
+        delta (- after before)
+        ;; -2 means "not my vote"; any other value is my vote's new value.
+        mine (if (string=? (gstr input :voter) (gstr state :me)) after -2)
+        root (dget state :root)
+        s1 (vote-in (vote-in state :posts target delta mine) :comments target delta mine)]
+    (if (and (> (document-count root) 0) (string=? (gstr root :id) target))
+      (document-assoc s1 :root (apply-vote root delta (>= mine -1) mine))
+      s1)))
+
+;; --- host inputs ----------------------------------------------------------
+
+(defn ingest [state :document input :document] :document
+  (let [t (gstr input :type)]
+    (cond
+      (string=? t "event") (admit-event state input)
+      (string=? t "vote") (admit-vote state input)
+      (string=? t "tick") (iput state :now (gint input :now))
+      (string=? t "me") (sput state :me (gstr input :pubkey))
+      (string=? t "route") (route-from-hash state (gstr input :hash))
+      (string=? t "sent") (document-assoc state :outbox (document-vector))
+      (string=? t "notice") (note state (cut (gstr input :text) 200))
+      :else state)))
+
+;; --- what the page needs --------------------------------------------------
+;;
+;; Nostr filters, built here. The host turns {:kinds :tag :values :ids
+;; :limit} into a REQ filter verbatim; it does not decide what to ask for.
+
+(defn strs [items :document k :keyword] :document
+  (let [n (document-count items)]
+    (loop [i 0 out (document-vector)]
+      (if (>= i n)
+        out
+        (recur (+ i 1) (document-vector-conj out (dget (dat items i) k)))))))
+
+(defn filter-tag [kind :i64 tag :string values :document limit :i64] :document
+  (document-map :kinds (document-vector (document-i64 kind))
+                :tag (document-string tag)
+                :values values
+                :limit (document-i64 limit)))
+
+(defn feed-wants [state :document] :document
+  (let [route (gstr state :route)
+        topic (if (string=? route "sub")
+                (string-concat "tsudoi-" (gstr state :sub))
+                "tsudoi")
+        ids (strs (dget state :posts) :id)
+        base (document-vector
+              (filter-tag 1 "t" (document-vector (document-string topic)) 300))]
+    (if (= (document-count ids) 0)
+      base
+      (-> base
+          (document-vector-conj (filter-tag 1 "e" ids 500))
+          (document-vector-conj (filter-tag 7 "e" ids 2000))))))
+
+(defn post-wants [state :document] :document
+  (let [id (gstr state :post-id)
+        targets (document-vector-conj (strs (dget state :comments) :id) (document-string id))]
+    (document-vector
+     (document-map :ids (document-vector (document-string id)))
+     (filter-tag 1 "e" (document-vector (document-string id)) 500)
+     (filter-tag 7 "e" targets 2000))))
+
+(defn wants [state :document] :document
+  (let [route (gstr state :route)]
+    (document-map
+     :epoch (dget state :epoch)
+     :relays (dget state :relays)
+     :me (dget state :me)
+     :filters (cond
+                (string=? route "post") (post-wants state)
+                (or (string=? route "front") (string=? route "sub")) (feed-wants state)
+                :else (document-vector)))))
+
+;; --- publishing -----------------------------------------------------------
+;;
+;; The outbox holds unsigned event templates. The host signs them with the
+;; user's key, broadcasts them to the relays in `wants`, and feeds the signed
+;; events back through `ingest` like any other event.
+
+(defn tag2 [a :string b :string] :document
+  (document-vector (document-string a) (document-string b)))
+
+(defn tag4 [a :string b :string c :string d :string] :document
+  (document-vector (document-string a) (document-string b)
+                   (document-string c) (document-string d)))
+
+(defn template [kind :i64 content :string tags :document] :document
+  (document-map :kind (document-i64 kind)
+                :content (document-string content)
+                :tags tags))
+
+(defn queue [state :document t :document] :document
+  (let [out (dget state :outbox)]
+    (if (>= (document-count out) 8)
+      (note state "still sending; try again in a moment")
+      (document-assoc state :outbox (document-vector-conj out t)))))
+
+(defn submit-post [state :document] :document
+  (let [sub (string-fold-case (gstr state :draft-sub))
+        title (gstr state :draft-title)
+        body (gstr state :draft-body)]
+    (cond
+      (string=? (gstr state :me) "") (note state "no key yet -- open settings")
+      (not (sub-name-ok? sub)) (note state "sub name: 2-24 of a-z 0-9 _")
+      (string=? title "") (note state "a post needs a title")
+      (> (string-byte-length title) (title-bytes)) (note state "title is too long")
+      (> (string-byte-length body) (body-bytes)) (note state "body is too long")
+      :else
+      (-> (queue state
+                 (template 1
+                           (if (string=? body "") title (string-concat title (string-concat "\n\n" body)))
+                           (document-vector (tag2 "t" "tsudoi")
+                                            (tag2 "t" (string-concat "tsudoi-" sub))
+                                            (tag2 "subject" title)
+                                            (tag2 "client" "tsudoi"))))
+          (sput :draft-title "")
+          (sput :draft-body "")
+          (remember-sub sub)
+          (note "posted -- it appears once a relay echoes it")))))
+
+(defn author-of [state :document id :string] :string
+  (let [root (dget state :root)
+        cs (dget state :comments)
+        i (index-of-id cs id)]
+    (cond
+      (and (> (document-count root) 0) (string=? (gstr root :id) id)) (gstr root :author)
+      (>= i 0) (gstr (dat cs i) :author)
+      :else "")))
+
+(defn submit-reply [state :document] :document
+  (let [root (gstr state :post-id)
+        parent (gstr state :reply-to)
+        body (gstr state :reply-body)
+        to (author-of state parent)]
+    (cond
+      (string=? (gstr state :me) "") (note state "no key yet -- open settings")
+      (string=? body "") state
+      (> (string-byte-length body) (comment-bytes)) (note state "comment is too long")
+      (string=? to "") (note state "that comment is gone")
+      :else
+      (-> (queue state
+                 (template 1 body
+                           (document-vector (tag4 "e" root "" "root")
+                                            (tag4 "e" parent "" "reply")
+                                            (tag2 "p" to)
+                                            (tag2 "client" "tsudoi"))))
+          (sput :reply-to "")
+          (sput :reply-body "")))))
+
+(defn find-author [state :document id :string] :string
+  (let [a (author-of state id)
+        posts (dget state :posts)
+        i (index-of-id posts id)]
+    (cond
+      (not (string=? a "")) a
+      (>= i 0) (gstr (dat posts i) :author)
+      :else "")))
+
+(defn find-mine [state :document id :string] :i64
+  (let [posts (dget state :posts)
+        cs (dget state :comments)
+        root (dget state :root)
+        i (index-of-id posts id)
+        j (index-of-id cs id)]
+    (cond
+      (>= i 0) (gint (dat posts i) :mine)
+      (>= j 0) (gint (dat cs j) :mine)
+      (and (> (document-count root) 0) (string=? (gstr root :id) id)) (gint root :mine)
+      :else 0)))
+
+;; A vote is a NIP-25 reaction. Voting the same way twice is a no-op: Nostr
+;; has no un-react short of a deletion request, and the relay keeps the old
+;; reaction anyway.
+(defn vote [state :document id :string value :i64] :document
+  (let [to (find-author state id)]
+    (cond
+      (string=? (gstr state :me) "") (note state "no key yet -- open settings")
+      (string=? to "") state
+      (= (find-mine state id) value) state
+      :else (queue state
+                   (template 7 (if (> value 0) "+" "-")
+                             (document-vector (tag2 "e" id)
+                                              (tag2 "p" to)
+                                              (tag2 "k" "1")))))))
+
+;; --- relays ---------------------------------------------------------------
+
+;; wss:// anywhere, plain ws:// only to this machine (a development relay).
+(defn relay-ok? [url :string] :bool
+  (and (or (starts-with? url "wss://")
+           (starts-with? url "ws://localhost:")
+           (starts-with? url "ws://127.0.0.1:"))
+       (> (string-byte-length url) 8)
+       (< (string-byte-length url) 200)
+       (not (string-contains? url " "))))
+
+(defn add-relay [state :document] :document
+  (let [url (gstr state :relay-draft)
+        rs (dget state :relays)]
+    (cond
+      (not (relay-ok? url)) (note state "a relay is a wss:// URL")
+      (has-str? rs url) (sput state :relay-draft "")
+      (>= (document-count rs) (relay-cap)) (note state "that is enough relays")
+      :else (-> state
+                (document-assoc :relays (document-vector-conj rs (document-string url)))
+                (sput :relay-draft "")
+                (iput :epoch (+ 1 (gint state :epoch)))))))
+
+(defn drop-relay [state :document i :i64] :document
+  (let [rs (dget state :relays)]
+    (if (or (< i 0) (>= i (document-count rs)) (<= (document-count rs) 1))
+      state
+      (-> state
+          (document-assoc :relays (document-vector-remove rs i))
+          (iput :epoch (+ 1 (gint state :epoch)))))))
+
+;; --- UI events ------------------------------------------------------------
+;;
+;; A node names itself with `data-k`; the host reports which name was acted
+;; on. Names are "<verb>:<argument>".
+
+(defn verb [target :string] :string
+  (let [i (string-index-of target ":")]
+    (if (< i 0) target (string-substring target 0 i))))
+
+(defn arg [target :string] :string
+  (let [i (string-index-of target ":")]
+    (if (< i 0) "" (string-substring target (+ i 1) (string-byte-length target)))))
+
+(defn index-arg [target :string limit :i64] :i64
+  (let [a (arg target)]
+    (loop [i 0]
+      (cond
+        (>= i limit) -1
+        (string=? (string-from-i64 i) a) i
+        :else (recur (+ i 1))))))
+
+(defn on-input [state :document target :string value :string] :document
+  (cond
+    (string=? target "draft-sub") (sput state :draft-sub (cut value 24))
+    (string=? target "draft-title") (sput state :draft-title (cut value 600))
+    (string=? target "draft-body") (sput state :draft-body (cut value 16000))
+    (string=? target "reply-body") (sput state :reply-body (cut value 4000))
+    (string=? target "relay-draft") (sput state :relay-draft (cut value 200))
+    :else state))
+
+(defn on-click [state :document target :string] :document
+  (let [v (verb target)]
+    (cond
+      (string=? v "sort") (sput state :sort (arg target))
+      (string=? v "up") (vote state (arg target) 1)
+      (string=? v "down") (vote state (arg target) -1)
+      (string=? v "reply") (-> state (sput :reply-to (arg target)) (sput :reply-body ""))
+      (string=? v "cancel-reply") (sput state :reply-to "")
+      (string=? v "send-reply") (submit-reply state)
+      (string=? v "submit") (submit-post state)
+      (string=? v "add-relay") (add-relay state)
+      (string=? v "drop-relay") (drop-relay state (index-arg target (relay-cap)))
+      (string=? v "dismiss") (sput state :notice "")
+      :else state)))
+
+(defn step [state :document target :string kind :string value :string] :document
+  (cond
+    (string=? kind "input") (on-input state target value)
+    (string=? kind "click") (on-click state target)
+    :else state))
+
+;; --- view -----------------------------------------------------------------
+;;
+;; Four element levels at most (see the header). `el` has children, `leaf`
+;; has text.
+
+(defn el [tag :string cls :string children :document] :document
+  (document-map :tag (document-string tag)
+                :attrs (document-map :class (document-string cls))
+                :children children))
+
+(defn leaf [tag :string attrs :document text :string] :document
+  (document-map :tag (document-string tag) :attrs attrs :text (document-string text)))
+
+(defn span [cls :string text :string] :document
+  (leaf "span" (document-map :class (document-string cls)) text))
+
+(defn link [cls :string href :string text :string] :document
+  (leaf "a" (document-map :class (document-string cls) :href (document-string href)) text))
+
+(defn button [cls :string k :string text :string] :document
+  (leaf "button" (document-map :class (document-string cls)
+                               :type (document-string "button")
+                               :data-k (document-string k))
+        text))
+
+(defn vote-buttons [row :document item :document] :document
+  (let [id (gstr item :id)
+        mine (gint item :mine)]
+    (-> row
+        (document-vector-conj (button (if (> mine 0) "up on" "up") (string-concat "up:" id) "▲"))
+        (document-vector-conj (span "score" (string-from-i64 (gint item :score))))
+        (document-vector-conj (button (if (< mine 0) "down on" "down") (string-concat "down:" id) "▼")))))
+
+(defn comments-label [n :i64] :string
+  (cond
+    (= n 0) "comment"
+    (= n 1) "1 comment"
+    :else (string-concat (string-from-i64 n) " comments")))
+
+(defn byline [state :document item :document] :string
+  (string-concat "by " (string-concat (short-id (gstr item :author))
+                                      (string-concat " · " (ago (gint state :now) (gint item :created))))))
+
+(defn post-row [state :document p :document] :document
+  (let [id (gstr p :id)
+        href (string-concat "#/p/" id)]
+    (el "div" "post"
+        (-> (vote-buttons (document-vector) p)
+            (document-vector-conj (link "title" href (gstr p :title)))
+            (document-vector-conj (link "sub" (string-concat "#/r/" (gstr p :sub))
+                                        (string-concat "r/" (gstr p :sub))))
+            (document-vector-conj (span "meta" (byline state p)))
+            (document-vector-conj (link "ncom" href (comments-label (gint p :ncom))))
+            (document-vector-conj (span "excerpt" (gstr p :body)))))))
+
+(defn sort-tab [m :string mode :string] :document
+  (button (if (string=? m mode) "tab on" "tab") (string-concat "sort:" m) m))
+
+(defn sort-tabs [state :document] :document
+  (let [mode (gstr state :sort)]
+    (el "div" "tabs" (document-vector (sort-tab "hot" mode) (sort-tab "new" mode) (sort-tab "top" mode)))))
+
+(defn feed-view [state :document] :document
+  (let [posts (dget state :posts)
+        order (ranked posts (gstr state :sort))
+        n (document-count order)
+        rows (loop [i 0 out (document-vector (sort-tabs state))]
+               (if (>= i n)
+                 out
+                 (recur (+ i 1)
+                        (document-vector-conj out (post-row state (dat posts (dint (dat order i))))))))]
+    (el "section" "feed"
+        (if (= n 0)
+          (document-vector-conj rows
+                                (el "div" "empty"
+                                    (document-vector (span "" "nothing here yet -- ")
+                                                     (link "" "#/submit" "start something"))))
+          rows))))
+
+;; --- thread ---------------------------------------------------------------
+
+(defn depth-of [cs :document c :document root :string] :i64
+  (loop [p (gstr c :parent) d 0]
+    (if (or (string=? p root) (>= d 6))
+      d
+      (let [i (index-of-id cs p)]
+        (if (< i 0) d (recur (gstr (dat cs i) :parent) (+ d 1)))))))
+
+;; Comments in tree order: each comment followed by its replies, siblings
+;; best-first. A comment whose parent never arrived hangs off the root.
+(defn parent-known? [cs :document c :document root :string] :bool
+  (or (string=? (gstr c :parent) root)
+      (>= (index-of-id cs (gstr c :parent)) 0)))
+
+(defn children-of [cs :document parent :string root :string] :document
+  (let [n (document-count cs)]
+    (loop [i 0 out (document-vector)]
+      (if (>= i n)
+        out
+        (let [c (dat cs i)
+              mine? (if (string=? parent root)
+                      (not (parent-known? cs c root))
+                      (string=? (gstr c :parent) parent))]
+          (recur (+ i 1)
+                 (if (or mine? (and (string=? parent root) (string=? (gstr c :parent) root)))
+                   (document-vector-conj out c)
+                   out)))))))
+
+(defn tree-order [cs :document root :string] :document
+  ;; An explicit stack of ids to visit, so the order needs no recursion.
+  (loop [stack (document-vector (document-string root)) out (document-vector) guard 0]
+    (let [n (document-count stack)]
+      (if (or (= n 0) (> guard 64))
+        out
+        (let [top (dstr (dat stack (- n 1)))
+              rest (document-vector-remove stack (- n 1))
+              kids (children-of cs top root)
+              order (ranked kids "top")
+              k (document-count order)
+              ;; push in reverse so the best child is visited first
+              pushed (loop [j (- k 1) st rest]
+                       (if (< j 0)
+                         st
+                         (recur (- j 1)
+                                (document-vector-conj st (dget (dat kids (dint (dat order j))) :id)))))
+              emitted (if (string=? top root)
+                        out
+                        (document-vector-conj out (dat cs (index-of-id cs top))))]
+          (recur pushed emitted (+ guard 1)))))))
+
+(defn reply-box [state :document k :string] :document
+  (el "div" "replybox"
+      (document-vector
+       (leaf "textarea" (document-map :data-k (document-string "reply-body")
+                                      :rows (document-string "4")
+                                      :placeholder (document-string "what are your thoughts?")
+                                      :value (document-string (gstr state :reply-body)))
+             "")
+       (button "primary" "send-reply" "reply")
+       (button "" "cancel-reply" "cancel"))))
+
+(defn comment-row [state :document cs :document c :document root :string] :document
+  (let [id (gstr c :id)
+        d (depth-of cs c root)]
+    (el "div" (string-concat "comment d" (string-from-i64 d))
+        (-> (vote-buttons (document-vector) c)
+            (document-vector-conj (span "meta" (byline state c)))
+            (document-vector-conj (span "body" (gstr c :body)))
+            (document-vector-conj (button "link" (string-concat "reply:" id) "reply"))))))
+
+(defn thread-view [state :document] :document
+  (let [root (dget state :root)
+        root-id (gstr state :post-id)
+        cs (dget state :comments)
+        order (tree-order cs root-id)
+        n (document-count order)
+        replying (gstr state :reply-to)
+        head (if (= (document-count root) 0)
+               (document-vector (el "div" "empty" (document-vector (span "" "looking for this post on the relays…"))))
+               (document-vector
+                (el "div" "post full"
+                    (-> (vote-buttons (document-vector) root)
+                        (document-vector-conj (span "title" (gstr root :title)))
+                        (document-vector-conj (link "sub" (string-concat "#/r/" (gstr root :sub))
+                                                    (string-concat "r/" (gstr root :sub))))
+                        (document-vector-conj (span "meta" (byline state root)))
+                        (document-vector-conj (span "body" (gstr root :body)))
+                        (document-vector-conj (button "link" (string-concat "reply:" root-id) "reply"))))))
+        with-box (if (string=? replying root-id)
+                   (document-vector-conj head (reply-box state "root"))
+                   head)
+        rows (loop [i 0 out with-box]
+               (if (>= i n)
+                 out
+                 (let [c (dat order i)
+                       out1 (document-vector-conj out (comment-row state cs c root-id))]
+                   (recur (+ i 1)
+                          (if (string=? replying (gstr c :id))
+                            (document-vector-conj out1 (reply-box state (gstr c :id)))
+                            out1)))))]
+    (el "section" "thread"
+        (if (> (gint state :hidden) 0)
+          (document-vector-conj rows
+                                (el "div" "empty"
+                                    (document-vector
+                                     (span "" (string-concat (string-from-i64 (gint state :hidden))
+                                                             " more comments not shown")))))
+          rows))))
+
+;; --- forms ----------------------------------------------------------------
+
+(defn field [tag :string k :string value :string placeholder :string] :document
+  (leaf tag (document-map :data-k (document-string k)
+                          :value (document-string value)
+                          :placeholder (document-string placeholder)
+                          :rows (document-string "10"))
+        ""))
+
+(defn submit-view [state :document] :document
+  (el "section" "form"
+      (document-vector
+       (el "div" "row"
+           (document-vector (span "label" "r/")
+                            (field "input" "draft-sub" (gstr state :draft-sub) "sub")))
+       (el "div" "row"
+           (document-vector (field "input" "draft-title" (gstr state :draft-title) "title")))
+       (el "div" "row"
+           (document-vector (field "textarea" "draft-body" (gstr state :draft-body) "text (optional)")))
+       (el "div" "row"
+           (document-vector (button "primary" "submit" "post")
+                            (span "hint" "signed with your key and sent to every relay below"))))))
+
+(defn relay-rows [state :document head :document] :document
+  (let [rs (dget state :relays)
+        n (document-count rs)]
+    (loop [i 0 out head]
+      (if (>= i n)
+        out
+        (recur (+ i 1)
+               (document-vector-conj
+                out
+                (el "div" "row"
+                    (document-vector (span "relay" (dstr (dat rs i)))
+                                     (button "link" (string-concat "drop-relay:" (string-from-i64 i)) "remove")))))))))
+
+(defn settings-view [state :document] :document
+  (el "section" "form"
+      (-> (relay-rows state
+                      (document-vector
+                       (el "div" "row" (document-vector (span "label" "relays -- every post, comment and vote goes to all of them")))))
+          (document-vector-conj
+           (el "div" "row"
+               (document-vector (field "input" "relay-draft" (gstr state :relay-draft) "wss://…")
+                                (button "" "add-relay" "add"))))
+          (document-vector-conj
+           (el "div" "row"
+               (document-vector (span "label" "you are ")
+                                (span "mono" (if (string=? (gstr state :me) "") "(no key)" (gstr state :me)))))))))
+
+;; --- frame ----------------------------------------------------------------
+
+(defn nav [state :document] :document
+  (let [subs (dget state :subs)
+        n (document-count subs)
+        cur (gstr state :sub)]
+    (el "nav" "subs"
+        (loop [i 0 out (document-vector (link (if (string=? (gstr state :route) "front") "on" "") "#/" "front"))]
+          (if (>= i n)
+            out
+            (let [s (dstr (dat subs i))]
+              (recur (+ i 1)
+                     (document-vector-conj out (link (if (string=? s cur) "on" "")
+                                                     (string-concat "#/r/" s)
+                                                     (string-concat "r/" s))))))))))
+
+(defn title-bar [state :document] :document
+  (let [route (gstr state :route)]
+    (el "header" "bar"
+        (document-vector
+         (link "brand" "#/" "tsudoi")
+         (span "where" (cond
+                         (string=? route "sub") (string-concat "r/" (gstr state :sub))
+                         (string=? route "post") "thread"
+                         (string=? route "submit") "new post"
+                         (string=? route "settings") "settings"
+                         :else "front page"))
+         (link "action" "#/submit" "+ post")
+         (link "action" "#/settings" (if (string=? (gstr state :me) "")
+                                       "settings"
+                                       (string-concat "@" (short-id (gstr state :me)))))))))
+
+(defn view [state :document] :document
+  (let [route (gstr state :route)
+        notice (gstr state :notice)
+        body (cond
+               (string=? route "post") (thread-view state)
+               (string=? route "submit") (submit-view state)
+               (string=? route "settings") (settings-view state)
+               :else (feed-view state))
+        top (document-vector (title-bar state) (nav state))
+        with-notice (if (string=? notice "")
+                      top
+                      (document-vector-conj top
+                                            (el "div" "notice"
+                                                (document-vector (span "" notice)
+                                                                 (button "link" "dismiss" "×")))))]
+    (el "div" "app" (document-vector-conj with-notice body))))
